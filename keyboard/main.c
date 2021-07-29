@@ -9,233 +9,191 @@
 #include "nrf_gpio.h"
 #include "nrf_drv_clock.h"
 #include "nrf_drv_rtc.h"
+// #include "nrf_drv_config.h"
+#include "nrf_delay.h"
 
-#define RTC_SCAN_PRESCALER  32      /* 1ms tick */
-#define RTC_SCAN_INTERVAL   5       /* 5ms (200Hz)*/
-#define RTC_OFF_PRESCALER   32      /* 1ms tick */
-#define RTC_OFF_INTERVAL    30000   /* 30 seconds */
+/*****************************************************************************/
+/** Configuration */
+/*****************************************************************************/
 
-#define RTC_BAT_LEVEL_PRESCALER 32
-#define RTC_BAT_LEVEL_INTERVAL  1000   /* 1000ms */
-
-#define SLEEP_INTERVAL      (500/RTC_SCAN_INTERVAL)    /* 500ms */
-#define KEEP_ALIVE_INTERVAL (BIREME_KEEP_ALIVE_TIMEOUT/RTC_SCAN_INTERVAL)
-
-/* Configure RTC instances for tasks */
-const nrf_drv_rtc_t rtc_scan = NRF_DRV_RTC_INSTANCE(0);
-const nrf_drv_rtc_t rtc_bat_level = NRF_DRV_RTC_INSTANCE(1);
-const nrf_drv_rtc_t rtc_off = NRF_DRV_RTC_INSTANCE(2);
+const nrf_drv_rtc_t rtc_maint = NRF_DRV_RTC_INSTANCE(0); /**< Declaring an instance of nrf_drv_rtc for RTC0. */
+const nrf_drv_rtc_t rtc_deb = NRF_DRV_RTC_INSTANCE(1); /**< Declaring an instance of nrf_drv_rtc for RTC1. */
 
 
-typedef struct key_def_s
-{
-	uint8_t port:1;
-	uint8_t pin_index:6;
-} key_def_s;
+// Define payload length
+#define TX_PAYLOAD_LENGTH ROWS ///< 5 byte payload length when transmitting
 
+// Data and acknowledgement payloads
+static uint8_t data_payload[TX_PAYLOAD_LENGTH];                ///< Payload to send to Host.
+static uint8_t ack_payload[NRF_GZLL_CONST_MAX_PAYLOAD_LENGTH]; ///< Placeholder for received ACK payloads from Host.
+
+// Debounce time (dependent on tick frequency)
+#define DEBOUNCE 5
+#define ACTIVITY 500
 
 // Key buffers
-static key_def_s keys[] = { 
-    S00, S01, S02, S03, S04, S05, S06, S07, S08, S09, 
-	S10, S11, S12, S13, S14, S15, S16, S17, S18, S19, 
-	S20, S21, S22, S23, S24, S25, S26, S27, S28, S29, 
-	S30, S31, S32, S33, S34};
+static uint8_t keys[ROWS], keys_snapshot[ROWS], keys_buffer[ROWS];
+static uint32_t debounce_ticks, activity_ticks;
+static volatile bool debouncing = false;
 
-#define NUM_KEYS sizeof(keys)
+// Debug helper variables
+static volatile bool init_ok, enable_ok, push_ok, pop_ok, tx_success;
 
-
-#define ACK_PAYLOAD_LENGTH BIREME_GZLL_ACK_PAYLOAD_LEN
-#define DATA_PAYLOAD_LENGTH BIREME_GZLL_DATA_PAYLOAD_LEN
-
-static uint8_t data_payload[DATA_PAYLOAD_LENGTH]; 
-static uint8_t ack_payload[NRF_GZLL_CONST_MAX_PAYLOAD_LENGTH];
-
-static uint32_t port_debounced[2];
-static uint32_t debounce_last[2];
-static uint32_t port_mask[2] = {0};
-
-static volatile bool key_down = false;
-
-static void gpio_config(void)            
+// Setup switch pins with pullups
+static void gpio_config(void)
 {
-    for (int s = 0; s < NUM_KEYS; s++)
-    {   
-        port_mask[keys[s].port] |= (1 << keys[s].pin_index);
+    nrf_gpio_cfg_sense_input(C01, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_HIGH);
+    nrf_gpio_cfg_sense_input(C02, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_HIGH);
+    nrf_gpio_cfg_sense_input(C03, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_HIGH);
+    nrf_gpio_cfg_sense_input(C04, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_HIGH);
+    nrf_gpio_cfg_sense_input(C05, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_HIGH);
+    nrf_gpio_cfg_sense_input(C06, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_HIGH);
+    nrf_gpio_cfg_sense_input(C07, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_SENSE_HIGH);
 
-        uint32_t pin_number = NRF_GPIO_PIN_MAP(keys[s].port, keys[s].pin_index);
-        nrf_gpio_cfg_sense_input(pin_number, NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
-    }
-    debounce_last[0] = port_debounced[0] = port_mask[0];
-    debounce_last[1] = port_debounced[1] = port_mask[1];
-
+    nrf_gpio_cfg_output(R01);
+    nrf_gpio_cfg_output(R02);
+    nrf_gpio_cfg_output(R03);
+    nrf_gpio_cfg_output(R04);
+    nrf_gpio_cfg_output(R05);
 }
 
+// Return the key states of one row
+static uint8_t read_row(uint32_t row)
+{
+    uint8_t buff = 0;
+    uint32_t input = 0;
+    nrf_gpio_pin_set(row);
+    input = NRF_GPIO->IN;
+    buff = (buff << 1) | ((input >> C01) & 1);
+    buff = (buff << 1) | ((input >> C02) & 1);
+    buff = (buff << 1) | ((input >> C03) & 1);
+    buff = (buff << 1) | ((input >> C04) & 1);
+    buff = (buff << 1) | ((input >> C05) & 1);
+    buff = (buff << 1) | ((input >> C06) & 1);
+    buff = (buff << 1) | ((input >> C07) & 1);
+    buff = (buff << 1);
+    nrf_gpio_pin_clear(row);
+    return buff;
+}
+
+// Return the key states
+static void read_keys(void)
+{
+    keys_buffer[0] = read_row(R01);
+    keys_buffer[1] = read_row(R02);
+    keys_buffer[2] = read_row(R03);
+    keys_buffer[3] = read_row(R04);
+    keys_buffer[4] = read_row(R05);
+    return;
+}
+
+static bool compare_keys(uint8_t* first, uint8_t* second, uint32_t size)
+{
+    for(int i=0; i < size; i++)
+    {
+        if (first[i] != second[i])
+        {
+          return false;
+        }
+    }
+    return true;
+}
+
+static bool empty_keys(void)
+{
+    for(int i=0; i < ROWS; i++)
+    {
+        if (keys_buffer[i])
+        {
+          return false;
+        }
+    }
+    return true;
+}
+
+// Assemble packet and send to receiver
 static void send_data(void)
 {
-    for (int i = 0; i < DATA_PAYLOAD_LENGTH; i++)
-        data_payload[i] = 0;
-
-    uint8_t bit = 0;
-    uint8_t byte = 0;
-    for (int i = 0; i < NUM_KEYS; i++)
+    for(int i=0; i < ROWS; i++)
     {
-        if ((port_debounced[keys[i].port] & (1 << keys[i].pin_index)) == 0)
-            data_payload[byte] |= (1 << bit);
-        bit++;
-        if (bit == 8)
+        data_payload[i] = keys[i];
+    }
+    nrf_gzll_add_packet_to_tx_fifo(PIPE_NUMBER, data_payload, TX_PAYLOAD_LENGTH);
+}
+
+// 8Hz held key maintenance, keeping the reciever keystates valid
+static void handler_maintenance(nrf_drv_rtc_int_type_t int_type)
+{
+    send_data();
+}
+
+// 1000Hz debounce sampling
+static void handler_debounce(nrf_drv_rtc_int_type_t int_type)
+{
+    read_keys();
+
+    // debouncing, waits until there have been no transitions in 5ms (assuming five 1ms ticks)
+    if (debouncing)
+    {
+        // if debouncing, check if current keystates equal to the snapshot
+        if (compare_keys(keys_snapshot, keys_buffer, ROWS))
         {
-            bit = 0;
-            byte++;
-        }        
+            // DEBOUNCE ticks of stable sampling needed before sending data
+            debounce_ticks++;
+            if (debounce_ticks == DEBOUNCE)
+            {
+                for(int j=0; j < ROWS; j++)
+                {
+                    keys[j] = keys_snapshot[j];
+                }
+                send_data();
+            }
+        }
+        else
+        {
+            // if keys change, start period again
+            debouncing = false;
+        }
     }
-
-    uint8_t bat_level = bat_level_read();
-    data_payload [DATA_PAYLOAD_LENGTH - 1] = bat_level;
-
-    nrf_gzll_add_packet_to_tx_fifo(PIPE_NUMBER, data_payload, DATA_PAYLOAD_LENGTH);
-}
-
-static void rtc_restart(const nrf_drv_rtc_t* rtc, uint32_t interval)
-{
-    nrf_drv_rtc_cc_set(rtc, 0, interval, true);
-    nrf_drv_rtc_counter_clear(rtc);
-}
-
-static void rtc_start(const nrf_drv_rtc_t* rtc, uint32_t interval)
-{
-    nrf_drv_rtc_cc_set(rtc, 0, interval, true);
-    nrf_drv_rtc_enable(rtc);
-}
-
-static void rtc_stop(const nrf_drv_rtc_t* rtc)
-{
-    nrf_drv_rtc_cc_disable(rtc, 0);
-    nrf_drv_rtc_disable(rtc);
-}
-
-
-static void system_on_sleep(void)
-{
-    /* Stop the scan and sleep tasks and start the system off task */
-    rtc_stop(&rtc_scan);    
-    rtc_start(&rtc_off, RTC_OFF_INTERVAL - SLEEP_INTERVAL);
-
-    /* Set the GPIOTE PORT event as interrupt source, and enable interrupts for GPIOTE */
-    NRF_GPIOTE->INTENSET = GPIOTE_INTENSET_PORT_Msk;
-    NRF_GPIOTE->EVENTS_PORT = 0;
-    NVIC_EnableIRQ(GPIOTE_IRQn);
-}
-
-static void system_on_wake(void)
-{
-    if(NRF_GPIOTE->EVENTS_PORT)
+    else
     {
-        /* clear wakeup event */
-        NRF_GPIOTE->EVENTS_PORT = 0;
+        // if the keystate is different from the last data
+        // sent to the receiver, start debouncing
+        if (!compare_keys(keys, keys_buffer, ROWS))
+        {
+            for(int k=0; k < ROWS; k++)
+            {
+                keys_snapshot[k] = keys_buffer[k];
+            }
+            debouncing = true;
+            debounce_ticks = 0;
+        }
+    }
 
-        /* Start scan and battery tasks */
-        rtc_start(&rtc_scan, RTC_SCAN_INTERVAL);
+    // looking for 500 ticks of no keys pressed, to go back to deep sleep
+    if (empty_keys())
+    {
+        activity_ticks++;
+        if (activity_ticks > ACTIVITY)
+        {
+            nrf_drv_rtc_disable(&rtc_maint);
+            nrf_drv_rtc_disable(&rtc_deb);
+            nrf_gpio_pin_set(R01);
+            nrf_gpio_pin_set(R02);
+            nrf_gpio_pin_set(R03);
+            nrf_gpio_pin_set(R04);
+            nrf_gpio_pin_set(R05);
+        }
 
-        /* Stop the system off task */
-        rtc_stop(&rtc_off);       
-
-        NVIC_DisableIRQ(GPIOTE_IRQn);
+    }
+    else
+    {
+        activity_ticks = 0;
     }
 
 }
 
-static void handler_bat_level(nrf_drv_rtc_int_type_t int_type)
-{
-    bat_level_update();
-}
-
-static void handler_off(nrf_drv_rtc_int_type_t int_type)
-{
-    /* Stop all RTC based tasks */
-    rtc_stop(&rtc_scan);
-    rtc_stop(&rtc_bat_level);
-    rtc_stop(&rtc_off);
-
-    bat_level_uninit();
-
-    /* Enter System Off mode. Waking from system off will generate a reset */
-    NRF_POWER->SYSTEMOFF = 1;
-}
-    
-static void handler_scan(nrf_drv_rtc_int_type_t int_type)
-{
-    static uint32_t keep_alive_count = 0;
-    static uint32_t sleep_count = 0;
-
-    rtc_restart(&rtc_scan, RTC_SCAN_INTERVAL);
-
-    bool key_event_detected = false;
-    uint32_t port[2];
-    uint32_t current[2];
-    uint32_t changed[2];
-    uint32_t debounced[2];
-
-    port[0] = nrf_gpio_port_in_read(NRF_P0);
-    port[1] = nrf_gpio_port_in_read(NRF_P1);
-
-
-    for (int i = 0; i < 2; i++)
-    {
-        current[i] = port[i] & port_mask[i];
-        changed[i] = debounce_last[i] ^ current[i];
-        debounce_last[i] = current[i];
-
-        debounced[i] = (port_debounced[i] & changed[i]) | 
-                       (current[i] & ~changed[i]);
-    }
-
-    key_down = (debounced[0] != port_mask[0]) ||
-               (debounced[1] != port_mask[1]);
-
-    if (port_debounced[0] != debounced[0] || port_debounced[1] != debounced[1])
-    {
-        port_debounced[0] = debounced[0];
-        port_debounced[1] = debounced[1];
-
-        key_event_detected = true;
-    }
-
-
-    sleep_count++;
-    keep_alive_count++;
-
-    if (key_event_detected)
-    {
-        send_data();
-        sleep_count = 0;
-        keep_alive_count = 0;
-    }
-    else if (key_down)
-    {
-        sleep_count = 0;
-    }
-    
-    if (sleep_count >= SLEEP_INTERVAL)
-    {
-        sleep_count = 0;
-        keep_alive_count = 0;
-        system_on_sleep();
-    }
-
-    /* If no key state changes occur, no data will be sent to the receiver. 
-     * To prevent the receiver from inferring that the keyboard has been 
-     * disconnected, send a periodic keep alive update. 
-     * Note: This is particularly important in the event a key is held down. */
-    if (keep_alive_count >= KEEP_ALIVE_INTERVAL)
-    {
-        send_data();
-        keep_alive_count = 0;
-    }
-
-    
-}
-
-
+// Low frequency clock configuration
 static void lfclk_config(void)
 {
     nrf_drv_clock_init();
@@ -243,71 +201,83 @@ static void lfclk_config(void)
     nrf_drv_clock_lfclk_request(NULL);
 }
 
+// RTC peripheral configuration
 static void rtc_config(void)
 {
-    nrf_drv_rtc_config_t scan_config = NRF_DRV_RTC_DEFAULT_CONFIG;
-    scan_config.prescaler = RTC_SCAN_PRESCALER;
+    //Initialize RTC instance
+    nrf_drv_rtc_init(&rtc_maint, NULL, handler_maintenance);
+    nrf_drv_rtc_init(&rtc_deb, NULL, handler_debounce);
 
-    nrf_drv_rtc_init(&rtc_scan, &scan_config, handler_scan);
+    //Enable tick event & interrupt
+    nrf_drv_rtc_tick_enable(&rtc_maint,true);
+    nrf_drv_rtc_tick_enable(&rtc_deb,true);
 
-    nrf_drv_rtc_config_t bat_level_config = NRF_DRV_RTC_DEFAULT_CONFIG;
-    bat_level_config.prescaler = RTC_BAT_LEVEL_PRESCALER;
-
-    nrf_drv_rtc_init(&rtc_bat_level, &bat_level_config, handler_bat_level);
-
-
-    nrf_drv_rtc_config_t off_config = NRF_DRV_RTC_DEFAULT_CONFIG;
-    off_config.prescaler = RTC_OFF_PRESCALER;
-
-    nrf_drv_rtc_init(&rtc_off, &off_config, handler_off);
-}
-
-void gazell_init(void)
-{
-    nrf_gzll_init(NRF_GZLL_MODE_DEVICE);
-    
-    nrf_gzll_set_max_tx_attempts(100);
-
-    /* Set base address for Gazell pipes 0 and 1 */
-    nrf_gzll_set_base_address_0(BIREME_GZLL_PIPE_0_ADDR);
-    nrf_gzll_set_base_address_1(BIREME_GZLL_PIPE_1_ADDR);
-
-    nrf_gzll_enable();
+    //Power on RTC instance
+    nrf_drv_rtc_enable(&rtc_maint);
+    nrf_drv_rtc_enable(&rtc_deb);
 }
 
 int main()
 {
-    /* Enable DC/DC converter */
-    NRF_POWER->DCDCEN = 1;
+    // Initialize Gazell
+    nrf_gzll_init(NRF_GZLL_MODE_DEVICE);
 
-    gazell_init();
+    // Attempt sending every packet up to 100 times
+    nrf_gzll_set_max_tx_attempts(100);
 
-    lfclk_config(); 
+    // Addressing
+    nrf_gzll_set_base_address_0(0x01020304);
+    nrf_gzll_set_base_address_1(0x05060708);
 
+    // Enable Gazell to start sending over the air
+    nrf_gzll_enable();
+
+    // Configure 32kHz xtal oscillator
+    lfclk_config();
+
+    // Configure RTC peripherals with ticks
     rtc_config();
 
+    // Configure all keys as inputs with pullups
     gpio_config();
 
-    bat_level_init();
+    // Set the GPIOTE PORT event as interrupt source, and enable interrupts for GPIOTE
+    NRF_GPIOTE->INTENSET = GPIOTE_INTENSET_PORT_Msk;
+    NVIC_EnableIRQ(GPIOTE_IRQn);
 
-    bat_level_update();
 
-    rtc_start(&rtc_scan, RTC_SCAN_INTERVAL);
-    rtc_start(&rtc_bat_level, RTC_BAT_LEVEL_INTERVAL);
-
-    /* System On sleep. Will be woken by RTC interrupts */
+    // Main loop, constantly sleep, waiting for RTC and gpio IRQs
     while(1)
     {
         __SEV();
         __WFE();
-        __WFE(); 
+        __WFE();
     }
 }
 
-/* Executed when gpio sense event triggers a wakeup from System On sleep */
+// This handler will be run after wakeup from system ON (GPIO wakeup)
 void GPIOTE_IRQHandler(void)
 {
-    system_on_wake();    
+    if(NRF_GPIOTE->EVENTS_PORT)
+    {
+        //clear wakeup event
+        NRF_GPIOTE->EVENTS_PORT = 0;
+
+        //enable rtc interupt triggers
+        nrf_drv_rtc_enable(&rtc_maint);
+        nrf_drv_rtc_enable(&rtc_deb);
+
+        nrf_gpio_pin_clear(R01);
+        nrf_gpio_pin_clear(R02);
+        nrf_gpio_pin_clear(R03);
+        nrf_gpio_pin_clear(R04);
+        nrf_gpio_pin_clear(R05);
+
+        //TODO: proper interrupt handling to avoid fake interrupts because of matrix scanning
+        //debouncing = false;
+        //debounce_ticks = 0;
+        activity_ticks = 0;
+    }
 }
 
 
@@ -318,7 +288,7 @@ void GPIOTE_IRQHandler(void)
 
 void  nrf_gzll_device_tx_success(uint32_t pipe, nrf_gzll_device_tx_info_t tx_info)
 {
-    uint32_t ack_payload_length = NRF_GZLL_CONST_MAX_PAYLOAD_LENGTH;    
+    uint32_t ack_payload_length = NRF_GZLL_CONST_MAX_PAYLOAD_LENGTH;
 
     if (tx_info.payload_received_in_ack)
     {
@@ -330,7 +300,7 @@ void  nrf_gzll_device_tx_success(uint32_t pipe, nrf_gzll_device_tx_info_t tx_inf
 // no action is taken when a packet fails to send, this might need to change
 void nrf_gzll_device_tx_failed(uint32_t pipe, nrf_gzll_device_tx_info_t tx_info)
 {
-    
+
 }
 
 // Callbacks not needed
@@ -338,4 +308,3 @@ void nrf_gzll_host_rx_data_ready(uint32_t pipe, nrf_gzll_host_rx_info_t rx_info)
 {}
 void nrf_gzll_disabled()
 {}
-
